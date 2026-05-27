@@ -409,7 +409,7 @@ SERIALIZER_SUPPORT_MATRIX = {
     "RotatingKVCache": "supported",  # Serialized as KVCache (keys/values/offset)
     "ArraysCache": "supported",
     "MambaCache": "supported",  # Legacy name for ArraysCache
-    "_QuantizedCacheWrapper": "not_supported_spill_dequantized",
+    "_QuantizedCacheWrapper": "supported_via_dequant_on_spill",
 }
 
 
@@ -663,6 +663,21 @@ class SSDCacheTier:
 
         Returns True if enqueued, False if queue is full (entry dropped).
         """
+        # Dequantize on the CALLER's thread, which owns the MLX GPU stream.
+        # mx.dequantize is a GPU compute op; running it on the writer thread
+        # aborts the process ("no Stream(gpu,N) in current thread"). Materialize
+        # with mx.eval so the writer thread only does a host-side copy. The layer
+        # serializers handle plain KVCache/ArraysCache, not _QuantizedCacheWrapper.
+        from .memory_cache import _QuantizedCacheWrapper, _dequantize_cache
+
+        if any(isinstance(layer, _QuantizedCacheWrapper) for layer in cache):
+            import mlx.core as mx
+
+            cache = _dequantize_cache(cache)
+            for layer in cache:
+                if getattr(layer, "keys", None) is not None:
+                    mx.eval(layer.keys, layer.values)
+
         try:
             self._spill_queue.put_nowait((tokens, cache, memory_bytes))
             return True
