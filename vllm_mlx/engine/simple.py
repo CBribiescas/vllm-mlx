@@ -444,13 +444,23 @@ class SimpleEngine(BaseEngine):
                         # make_cache; probing with default args would mis-classify that
                         # path as snapshot-safe.
                         try:
-                            from mlx_lm.models.cache import KVCache, make_prompt_cache
+                            from mlx_lm.models.cache import (
+                                ArraysCache,
+                                KVCache,
+                                make_prompt_cache,
+                            )
 
                             probe_cache = make_prompt_cache(
                                 self._text_model, max_kv_size=self._max_kv_size or None
                             )
+                            # Hybrid models (e.g. Qwen3.5/3.6 MoE) interleave
+                            # full-attention KVCache with linear-attention
+                            # ArraysCache. Both snapshot safely as long as the
+                            # snapshot/restore copies the state container (the
+                            # cache branch below does), so allow either.
                             self._supports_system_kv_cache = bool(probe_cache) and all(
-                                isinstance(c, KVCache) for c in probe_cache
+                                isinstance(c, (KVCache, ArraysCache))
+                                for c in probe_cache
                             )
                             if not self._supports_system_kv_cache:
                                 cache_types = sorted(
@@ -2049,7 +2059,18 @@ class SimpleEngine(BaseEngine):
                                 text_model, max_kv_size=_max_kv_size or None
                             )
                             for i, saved_state in enumerate(system_kv_snapshot):
-                                backbone_cache[i].state = saved_state
+                                # Fresh container per request: ArraysCache mutates
+                                # its state list in place (cache[idx] = ...), so a
+                                # shared reference would corrupt the snapshot for
+                                # subsequent hits. KVCache replaces its arrays, so
+                                # copying the tuple is harmless there.
+                                backbone_cache[i].state = (
+                                    tuple(saved_state)
+                                    if isinstance(saved_state, tuple)
+                                    else list(saved_state)
+                                    if isinstance(saved_state, list)
+                                    else saved_state
+                                )
 
                             prompt_to_send = mx.array(suffix_tokens)
                             return backbone_cache, prompt_to_send
@@ -2236,9 +2257,16 @@ class SimpleEngine(BaseEngine):
                     model(sys_arr[None], cache=mc)
                     mx.eval([c.state for c in mc])
 
-                # Snapshot backbone cache (immutable mx.arrays, safe to reuse)
-                snapshot = [c.state for c in mc]
-                mx.eval([s for pair in snapshot for s in pair])
+                # Snapshot backbone cache. The underlying mx.arrays are immutable
+                # once eval'd; copy the state CONTAINER so a later in-place mutation
+                # (ArraysCache reassigns cache[idx]) can't corrupt the stored
+                # snapshot. KVCache.state is a (keys, values) tuple; ArraysCache.state
+                # is a list that may contain None for not-yet-populated layers.
+                snapshot = [
+                    tuple(c.state) if isinstance(c.state, tuple) else list(c.state)
+                    for c in mc
+                ]
+                mx.eval([s for st in snapshot for s in st if s is not None])
 
                 self._system_kv_cache[system_hash] = (snapshot, system_token_count)
                 self._system_kv_cache.move_to_end(system_hash)
@@ -2266,7 +2294,7 @@ class SimpleEngine(BaseEngine):
                     "System KV cache: stored %d-token snapshot (%.1f MB), "
                     "prefilling %d remaining",
                     system_token_count,
-                    sum(c.nbytes for c in mc) / 1e6,
+                    sum(getattr(c, "nbytes", 0) for c in mc) / 1e6,
                     len(suffix_tokens),
                 )
 
