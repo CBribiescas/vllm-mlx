@@ -104,8 +104,10 @@ Per-round arithmetic at k=7: 28 ms verify + ~4 ms draft for a mean of ~4.2 kept 
 batched-expert kernels put the marginal near 1.1×/k.
 
 The ceiling in closed form, with `r` the fraction of rounds that need the re-advance and
-`k` the block: `1 / (r + (1 - r) / k)` ≈ 1.7× at the measured acceptance. A realistic
-~1.3× on this stack would need a single-forward commit path that hybrid models do not have.
+`k` the block: `1 / (r + (1 - r) / k)`, which is ≈ 1.15× at the measured r = 0.85 and k = 7.
+(An earlier revision of this page said 1.7×; that was an arithmetic error.) The
+single-forward commit path that would remove the re-advance does not exist for hybrid
+models, so on this target the measured 0.83–0.87× is the number to plan around.
 
 The same curve explains why Lightning's built-in single-token MTP head breaks even here
 (74.5 % acceptance and still 106 vs 115–134 tok/s, see #710 for the equivalent measurement on
